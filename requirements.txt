@@ -1,0 +1,7 @@
+streamlit
+textblob
+deep-translator
+langdetect
+pandas
+plotly
+argostranslate

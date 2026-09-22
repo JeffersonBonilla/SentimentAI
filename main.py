@@ -451,7 +451,10 @@ st.markdown(
     '<div class="subtitle">'
     'Sistema de análisis de sentimiento basado en procesamiento '
     'de lenguaje natural.'
-    '</div>',
+    '</div>'
+    '<div class="subtitle">'
+        'Presentado por Jefferson bonilla y Ricardo Martinez. REG-SAN MIGUEL'
+        '</div>',
     unsafe_allow_html=True
 )
 

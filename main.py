@@ -1,4 +1,5 @@
 import streamlit as st
+import requests
 from textblob import TextBlob
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from langdetect import detect
@@ -8,9 +9,56 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 import re
+import unicodedata
 
 
-# Argos guarda los modelos dentro del proyecto, no en el perfil del usuario.
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_weather(location_name):
+    geocoding_response = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": location_name, "count": 1, "language": "es", "format": "json"},
+        timeout=10,
+    )
+    geocoding_response.raise_for_status()
+    locations = geocoding_response.json().get("results", [])
+    if not locations:
+        raise ValueError("No se encontró esa ubicación.")
+
+    location = locations[0]
+    weather_response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": (
+                "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                "precipitation,weather_code,wind_speed_10m"
+            ),
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "kmh",
+            "timezone": "auto",
+        },
+        timeout=10,
+    )
+    weather_response.raise_for_status()
+    return location, weather_response.json()
+
+
+def describe_weather_code(code):
+    descriptions = {
+        0: ("☀️", "Despejado"), 1: ("🌤️", "Mayormente despejado"),
+        2: ("⛅", "Parcialmente nublado"), 3: ("☁️", "Nublado"),
+        45: ("🌫️", "Niebla"), 48: ("🌫️", "Niebla con escarcha"),
+        51: ("🌦️", "Llovizna ligera"), 53: ("🌦️", "Llovizna moderada"),
+        55: ("🌧️", "Llovizna intensa"), 61: ("🌧️", "Lluvia ligera"),
+        63: ("🌧️", "Lluvia moderada"), 65: ("🌧️", "Lluvia intensa"),
+        80: ("🌦️", "Chubascos ligeros"), 81: ("🌧️", "Chubascos moderados"),
+        82: ("⛈️", "Chubascos intensos"), 95: ("⛈️", "Tormenta eléctrica"),
+        96: ("⛈️", "Tormenta con granizo ligero"),
+        99: ("⛈️", "Tormenta con granizo intenso"),
+    }
+    return descriptions.get(code, ("🌡️", "Condición variable"))
 ARGOS_ROOT = Path(__file__).resolve().parent
 os.environ.setdefault("XDG_DATA_HOME", str(ARGOS_ROOT / ".argos-data"))
 os.environ.setdefault("XDG_CONFIG_HOME", str(ARGOS_ROOT / ".argos-config"))
@@ -122,7 +170,7 @@ if "last_result" not in st.session_state:
 
 
 SPANISH_POSITIVE_WORDS = {
-    "amo", "amamos", "bueno", "buena", "buenisimo", "excelente",
+    "amo", "amamos", "bueno", "buen", "buena", "buenisimo", "excelente",
     "encanta", "encanto", "feliz", "fantastico", "genial", "gusta",
     "increible", "maravilloso", "mejor", "perfecto", "positivo",
     "recomiendo", "satisfecho", "satisfecha"
@@ -130,7 +178,7 @@ SPANISH_POSITIVE_WORDS = {
 
 SPANISH_NEGATIVE_WORDS = {
     "aburrido", "decepcion", "decepcionado", "decepcionante", "dolor",
-    "horrible", "malo", "mala", "molesto", "negativo", "odio",
+    "feo", "fea", "horrible", "mal", "malo", "mala", "molesto", "negativo", "odio",
     "maldad", "peor", "pesimo", "problema", "terrible", "triste"
 }
 
@@ -240,6 +288,107 @@ def classify_sentiment(polarity):
         "color": "#facc15",
         "description": "El texto presenta una tendencia emocional neutral."
     }
+
+
+def normalize_token(token):
+    return "".join(
+        char for char in unicodedata.normalize("NFD", token.lower())
+        if unicodedata.category(char) != "Mn"
+    )
+
+
+def analyze_word_details(text):
+    """Aplica cargas léxicas, intensificadores, negación y peso adversativo."""
+    tokens = re.findall(r"[^\W_]+(?:['’][^\W_]+)*", text, flags=re.UNICODE)
+    positive = {normalize_token(word) for word in SPANISH_POSITIVE_WORDS | ENGLISH_POSITIVE_WORDS}
+    negative = {normalize_token(word) for word in SPANISH_NEGATIVE_WORDS | ENGLISH_NEGATIVE_WORDS}
+    base_values = {word: 0.7 for word in positive}
+    base_values.update({word: -0.7 for word in negative})
+    base_values.update({
+        "feo": -0.6, "fea": -0.6, "malo": -0.7, "mala": -0.7, "mal": -0.7,
+        "bueno": 0.7, "buen": 0.7, "buena": 0.7,
+        "excelente": 0.9, "perfecto": 0.9, "perfecta": 0.9,
+        "horrible": -0.9, "terrible": -0.9, "odio": -1.0, "hate": -1.0,
+        "love": 1.0, "amo": 1.0,
+    })
+
+    intensifiers = {"muy": 1.5, "bastante": 1.5, "extremadamente": 2.0, "sumamente": 2.0}
+    negators = {"no", "nunca", "jamas"}
+    normalized = [normalize_token(token) for token in tokens]
+    adversatives = []
+    for index, token in enumerate(normalized):
+        if token == "pero":
+            adversatives.append((index, index + 1))
+        elif token == "sin" and index + 1 < len(tokens) and normalized[index + 1] == "embargo":
+            adversatives.append((index, index + 2))
+
+    adversative_tokens = {
+        index for start, end in adversatives for index in range(start, end)
+    }
+    rows = []
+    total = 0.0
+    has_adversative = bool(adversatives)
+    for index, (token, word) in enumerate(zip(tokens, normalized)):
+        base = base_values.get(word, 0.0)
+        modifier_parts = []
+        factor = 1.0
+        if base != 0.0:
+            for previous in range(max(0, index - 3), index):
+                if any(start <= previous < end or previous < start < index for start, end in adversatives):
+                    continue
+                if normalized[previous] in negators:
+                    factor *= -0.5
+                    modifier_parts.append(f"Negación: {tokens[previous]} × -0.5")
+                    break
+            for previous in range(max(0, index - 2), index):
+                if any(start <= previous < end or previous < start < index for start, end in adversatives):
+                    continue
+                intensity = intensifiers.get(normalized[previous])
+                if intensity:
+                    factor *= intensity
+                    modifier_parts.append(f"Intensificador: {tokens[previous]} × {intensity:.1f}")
+                    break
+
+        adjusted = base * factor
+        clause_weight = 1.0
+        if has_adversative and any(index < start for start, _ in adversatives):
+            clause_weight = 0.4
+        contribution = adjusted * clause_weight
+        total += contribution
+        if base > 0:
+            load_type = "Positiva"
+        elif base < 0:
+            load_type = "Negativa"
+        elif word in intensifiers:
+            load_type = "Intensificador"
+        elif word in negators:
+            load_type = "Negación"
+        elif index in adversative_tokens:
+            load_type = "Conector adversativo"
+        else:
+            load_type = "Neutral / sin coincidencia"
+        rows.append({
+            "N.º": index + 1,
+            "Palabra": token,
+            "Carga": load_type,
+            "Valor base": round(base, 2),
+            "Modificador": "; ".join(modifier_parts) or "—",
+            "Valor ajustado": round(adjusted, 2),
+            "Peso cláusula": clause_weight,
+            "Aporte": round(contribution, 2),
+        })
+
+    if total >= 1.0:
+        verdict = ("Positivo alto", "Recomendado ampliamente")
+    elif total >= 0.2:
+        verdict = ("Positivo moderado", "Experiencia satisfactoria")
+    elif total > -0.2:
+        verdict = ("Neutro / mixto", "Opinión indiferente o neutra")
+    elif total > -1.0:
+        verdict = ("Negativo moderado", "Atención / experiencia deficiente")
+    else:
+        verdict = ("Negativo alto", "Alerta / experiencia crítica")
+    return rows, total, verdict
 
 
 def analyze_text(text, use_translation=False):
@@ -388,6 +537,9 @@ with st.sidebar:
 
     st.divider()
 
+    st.markdown("### 🌦️ Clima")
+    weather_location = st.text_input("Ubicación", "San Miguel, El Salvador")
+
     st.markdown("### ⚙️ Configuración")
 
     use_translation = st.toggle(
@@ -457,6 +609,27 @@ st.markdown(
         '</div>',
     unsafe_allow_html=True
 )
+
+st.markdown("## 🌦️ Clima actual")
+try:
+    location_data, weather_data = fetch_weather(weather_location)
+    current = weather_data["current"]
+    icon, condition = describe_weather_code(current["weather_code"])
+    location_label = ", ".join(
+        part for part in (location_data.get("name"), location_data.get("admin1"), location_data.get("country"))
+        if part
+    )
+    with st.container(border=True):
+        st.markdown(f"### {icon} {location_label}")
+        st.caption(f"{condition} · Actualizado: {current['time'].replace('T', ' ')}")
+        weather_cols = st.columns(4)
+        weather_cols[0].metric("Temperatura", f"{current['temperature_2m']} °C")
+        weather_cols[1].metric("Sensación", f"{current['apparent_temperature']} °C")
+        weather_cols[2].metric("Humedad", f"{current['relative_humidity_2m']} %")
+        weather_cols[3].metric("Viento", f"{current['wind_speed_10m']} km/h")
+        st.caption("Datos de [Open-Meteo](https://open-meteo.com/)")
+except (requests.RequestException, ValueError, KeyError, IndexError) as error:
+    st.info(f"No se pudo cargar el clima para esa ubicación: {error}")
 
 
 def clear_input_text():
@@ -611,6 +784,26 @@ if result:
 
     st.markdown("### 📝 Texto procesado")
 
+    st.markdown("### Detalle tokenizado")
+    st.caption(
+        "Valores base léxicos: intensificadores multiplican la carga, "
+        "la negación la invierte al 50 % y la primera cláusula antes de «pero» "
+        "se pondera al 40 %."
+    )
+    token_rows, lexical_total, lexical_verdict = analyze_word_details(result["original_text"])
+    if token_rows:
+        st.dataframe(pd.DataFrame(token_rows), use_container_width=True, hide_index=True)
+        score_col, verdict_col = st.columns([1, 3])
+        score_col.metric("Puntaje léxico total", f"{lexical_total:+.2f}")
+        verdict_text, verdict_label = lexical_verdict
+        if lexical_total >= 0.2:
+            verdict_col.success(f"{verdict_text}: {verdict_label}")
+        elif lexical_total <= -0.2:
+            verdict_col.error(f"{verdict_text}: {verdict_label}")
+        else:
+            verdict_col.info(f"{verdict_text}: {verdict_label}")
+    else:
+        st.info("No se encontraron palabras para mostrar.")
     with st.container(border=True):
 
         st.write(
@@ -662,15 +855,25 @@ if st.session_state.history:
                 item["subjectivity"], 3
             ),
             "Palabras": item["word_count"],
-            "Texto": item["original_text"][:70]
+            "Texto": item["original_text"]
         })
 
     df = pd.DataFrame(history_data)
+    display_df = df.copy()
+    display_df["Texto"] = display_df["Texto"].str.slice(0, 70)
 
     st.dataframe(
-        df,
+        display_df,
         use_container_width=True,
         hide_index=True
+    )
+
+    st.download_button(
+        "⬇️ Descargar historial CSV",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="historial_sentimentai.csv",
+        mime="text/csv",
+        use_container_width=True,
     )
 
 
@@ -680,3 +883,6 @@ st.caption(
     "🧠 SentimentAI • Procesamiento de Lenguaje Natural "
     "• TextBlob + Python + Streamlit"
 )
+
+
+
